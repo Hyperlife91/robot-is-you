@@ -1,4 +1,5 @@
 import asyncio
+import configparser
 import io
 import aiohttp
 import base64
@@ -6,7 +7,7 @@ import discord
 import json
 import zlib
 
-from discord.ext import commands
+from discord.ext import commands, tasks
 from functools   import partial
 from os          import listdir, stat
 from src.utils   import Tile
@@ -161,8 +162,11 @@ class Reader(commands.Cog, command_attrs=dict(hidden=True)):
         if stat(levelcache).st_size != 0:
             self.level_data = json.load(open(levelcache))
         custom = "cache/customlevels.json"
+        
+        # custom
         if stat(custom).st_size != 0:
             self.custom_levels = json.load(open(custom))
+        self.save_custom_levels.start()
 
     async def render_custom(self, code: str):
         '''Renders a custom level. code should be valid (but is checked regardless)'''
@@ -504,18 +508,22 @@ class Reader(commands.Cog, command_attrs=dict(hidden=True)):
             fp = open(grid.fp + "d", errors="replace")
         else:
             fp = data
+
+        config = configparser.ConfigParser()
+        config.read_file(fp)
+        
         # Paths
-        grid = self.add_paths(grid, file=fp)
+        grid = self.add_paths(grid, conf=config)
         # Levels
-        grid = self.add_levels(grid, file=fp, initialize=initialize) # If we want to also initialize the level tree
+        grid = self.add_levels(grid, conf=config, initialize=initialize) # If we want to also initialize the level tree
         # Images
-        grid = self.add_images(grid, file=fp)
+        grid = self.add_images(grid, conf=config)
         # Level metadata (must be below add_specials)
-        grid = self.add_metadata(grid, file=fp)
+        grid = self.add_metadata(grid, conf=config)
         # Special objects
-        grid = self.add_specials(grid, file=fp, initialize=initialize)
+        grid = self.add_specials(grid, conf=config, initialize=initialize)
         # Object changes
-        grid = self.add_changes(grid, file=fp)
+        grid = self.add_changes(grid, conf=config)
 
         # Makes sure objects within a single cell are rendered in the right order
         grid = self.sort_layers(grid)
@@ -531,78 +539,88 @@ class Reader(commands.Cog, command_attrs=dict(hidden=True)):
 
         return grid
 
-    def add_changes(self, grid, file):
+    def add_changes(self, grid, conf: configparser.ConfigParser):
         '''Modifies the objects in the level according to the changes proposed in the given file.'''
-        # the .ld file
-        file.seek(0)
-        changes = {}
-
-        # Go through each line of the file
-        raw = None
-        while raw != "":
-            raw = file.readline()
-            line = raw.strip()
+        if conf.has_section("tiles"):
+            section = conf["tiles"]
             
-            # We're starting parsing the object changes section
-            if line == "[tiles]":
-                rawl = None
-                while rawl != "":
-                    rawl = file.readline()
-                    data = rawl.strip()
-
-                    # Which objects are changed?
-                    if data.startswith("changed="):
-                        changes = dict.fromkeys(line[8:].split(","), None)
-                        continue
-                    
-                    # We're done parsing
-                    # We've exited [tiles] and entered a new "group"
-                    if data.startswith("["):
-                        break
-
-                    # Parsing
-                    index = try_index(data, "=")
-                    if index == -1: continue
-
-                    # These are the bits of information we care about
-                    values = ["_name", "_image", "_colour", "_activecolour"]
-                    for v in values:
-                        param_index = try_index(data, v)
-                        if param_index != -1:
+            keys = set(conf["tiles"]["changed"].split(","))
+            changes = {}
+            values = ["_name", "_image", "_colour", "_activecolour"]
+            for k, v in section.items():
+                for x in values:
+                    if k.endswith(x):
+                        key = k[:k.index(x)]
+                        if key in keys:
+                            changes.setdefault(key, {})[x] = v
                             break
-                        # Don't need the line anymore, move on
-                    if param_index == -1:
-                        continue
-                    
-                    # This will be an element of `values`
-                    param = data[param_index:index]
 
-                    # The object ID prefixing the line
-                    key = data[:param_index]
-                    if changes.get(key) is None:
-                        changes[key] = {}
-                    changes[key][param] = data[index + 1:]
-        
-        # Updates the grid:
-        # The name and color are updated.
-        if changes:
-            for cell in grid.cells:
-                for item in cell.objects:
-                    new = changes.get(item.obj)
-                    if new is not None:
-                        if new.get("_name") is not None:
-                            item.name = new["_name"]
-                        elif new.get("_image") is not None:
-                            item.name = new["_image"]
-                        if new.get("_activecolour") is not None and item.name.startswith("text_"):
-                            item.color = [int(new["_activecolour"][0]), int(new["_activecolour"][2])]
-                        elif new.get("_colour") is not None:
-                            item.color = [int(new["_colour"][0]), int(new["_colour"][2])]
+            # # Go through each line of the file
+            # raw = None
+            # while raw != "":
+            #     raw = file.readline()
+            #     line = raw.strip()
+                
+            #     # We're starting parsing the object changes section
+            #     if line == "[tiles]":
+            #         rawl = None
+            #         while rawl != "":
+            #             rawl = file.readline()
+            #             data = rawl.strip()
+
+            #             # Which objects are changed?
+            #             if data.startswith("changed="):
+            #                 changes = dict.fromkeys(line[8:].split(","), None)
+            #                 continue
+                        
+            #             # We're done parsing
+            #             # We've exited [tiles] and entered a new "group"
+            #             if data.startswith("["):
+            #                 break
+
+            #             # Parsing
+            #             index = try_index(data, "=")
+            #             if index == -1: continue
+
+            #             # These are the bits of information we care about
+            #             values = ["_name", "_image", "_colour", "_activecolour"]
+            #             for v in values:
+            #                 param_index = try_index(data, v)
+            #                 if param_index != -1:
+            #                     break
+            #                 # Don't need the line anymore, move on
+            #             if param_index == -1:
+            #                 continue
+                        
+            #             # This will be an element of `values`
+            #             param = data[param_index:index]
+
+            #             # The object ID prefixing the line
+            #             key = data[:param_index]
+            #             if changes.get(key) is None:
+            #                 changes[key] = {}
+            #             changes[key][param] = data[index + 1:]
+            
+            # Updates the grid:
+            # The name and color are updated.
+            if changes:
+                for cell in grid.cells:
+                    for item in cell.objects:
+                        new = changes.get(item.obj)
+                        if new is not None:
+                            if new.get("_name") is not None:
+                                item.name = new["_name"]
+                            elif new.get("_image") is not None:
+                                item.name = new["_image"]
+                            if new.get("_activecolour") is not None and item.name.startswith("text_"):
+                                item.color = [int(new["_activecolour"][0]), int(new["_activecolour"][2])]
+                            elif new.get("_colour") is not None:
+                                item.color = [int(new["_colour"][0]), int(new["_colour"][2])]
 
         
         return grid
 
-    def add_metadata(self, grid, file):
+    def add_metadata(self, grid, conf: configparser.ConfigParser):
         '''Adds level metadata from the given file to the given Grid.
         Adds the following information:
         * Level name 
@@ -610,36 +628,40 @@ class Reader(commands.Cog, command_attrs=dict(hidden=True)):
         * Palette
         * Cursor position
         '''
-        # Our data
-        name = subtitle = palette = cursor_x = cursor_y = map_id = None
-        file.seek(0)
-        # Go through each line of the file
-        line = None
-        while line != "":
-            line = file.readline().strip()
-            # Level name
-            if line.startswith("name="):
-                name = line[5:]
-            # Palette (strip .png)
-            if line.startswith("palette="):
-                palette = line[8:-4]
-            # Level subtitle
-            if line.startswith("subtitle="):
-                subtitle = line[9:]
-            # Custom level parent
-            if line.startswith("mapid="):
-                map_id = line[6:]
-            # Cursor position
-            if line.startswith("selectorX="):
-                pos = line[10:]
-                if pos != -1:
-                    cursor_x = int(pos)
-            if line.startswith("selectorY="):
-                pos = line[10:]
-                if pos != -1:
-                    cursor_y = int(pos)
+        
+        name = conf["general"]["name"]
+        subtitle = conf.get("general", "subtitle", fallback=None)
+        palette = conf.get("general", "palette", fallback="default.png")[:-4]
+        map_id = conf.get("general", "mapid", fallback=None)
+        cursor_x = conf.getint("general", "selectorx", fallback=-1)
+        cursor_y = conf.getint("general", "selectory", fallback=-1)
+
+        # while line != "":
+        #     line = file.readline().strip()
+        #     # Level name
+        #     if line.startswith("name="):
+        #         print("why")
+        #         name = line[5:]
+        #     # Palette (strip .png)
+        #     if line.startswith("palette="):
+        #         palette = line[8:-4]
+        #     # Level subtitle
+        #     if line.startswith("subtitle="):
+        #         subtitle = line[9:]
+        #     # Custom level parent
+        #     if line.startswith("mapid="):
+        #         map_id = line[6:]
+        #     # Cursor position
+        #     if line.startswith("selectorX="):
+        #         pos = line[10:]
+        #         if pos != -1:
+        #             cursor_x = int(pos)
+        #     if line.startswith("selectorY="):
+        #         pos = line[10:]
+        #         if pos != -1:
+        #             cursor_y = int(pos)
         # Add cursor
-        if cursor_x is not None and cursor_y is not None:
+        if cursor_x != -1 and cursor_y != -1:
             cursor_position = flatten(cursor_x, cursor_y, grid.width)
             grid.cells[cursor_position].objects.append(self.defaults_by_name["cursor"])
 
@@ -647,426 +669,472 @@ class Reader(commands.Cog, command_attrs=dict(hidden=True)):
         grid.name = name
         grid.subtitle = subtitle
         # Palette
-        if palette is None:
-            grid.palette = "default"
-        else:
-            grid.palette = palette
+        grid.palette = palette
         # Personal map ID
         if map_id is not None:
             grid.map_id = map_id
 
         return grid
 
-    def add_levels(self, grid, file, initialize=False):
+    def add_levels(self, grid, conf: configparser.ConfigParser, initialize=False):
         '''Adds raw level objects from within a level to the given Grid.
         Data is parsed from the given file.
         if `initialize` is True, adds levels to the global level tree.
         '''
-        file.seek(0)
-        levels = {}
-        icons = {}
-        level_count = 0
         map_id = ""
-        # Go through each line of the file
-        line = None
-        while line != "":
-            line = file.readline().strip()
-            # How many levels are there in the map??
-            if line.startswith("levels="):
-                level_count = int(line[7:])
-            # When initializing the level tree:
-            if initialize and line.startswith("mapid="):
-                map_id = line[6:]
-            
-            # We're starting parsing levels
-            if line == "[levels]":
-                data = None
-                while data != "":
-                    data = file.readline().strip()
-                    
-                    # We're done parsing
-                    # We've exited [levels] and entered a new "group"
-                    if data.startswith("["):
-                        break
-                    
-                    # not what we're looking for
-                    if not data[:1].isnumeric():
-                        continue
 
-                    # Parsing
-                    index = data.index("=")
+        level_count = conf.getint("general", "levels")
+        if conf.has_section("levels"):
+            levels_section = conf["levels"]
 
-                    # These are the bits of information we care about
-                    if initialize:
-                        values = ["X", "Y", "style", "colour", "number", "file", "name"]
-                    else:
-                        values = ["X", "Y", "style", "colour", "number"]
-                    for v in values:
-                        param_index = try_index(data, v)
-                        if param_index != -1:
-                            break
-                        # Don't need the line anymore, move on
-                    if param_index == -1:
-                        continue
-                    
-                    # This will be an element of `values`
-                    param = data[param_index:index]
-
-                    # The number prefixing the line
-                    key = data[:param_index]
-                    if key.isnumeric():
-                        # Ignore levels with IDs above the levelcount
-                        # Because those are not actual levels???
-                        if int(key) <= level_count - 1:
-                            # If the level is new
-                            if levels.get(key) is None:
-                                levels[key] = {}
-                            # Store the level data
-                            levels[key][param] = data[index + 1:]
-                
-            # We're starting parsing level icons
-            if line == "[icons]":
-                data = None
-                while data != "":
-                    data = file.readline().strip()
-                    
-                    # We're done parsing
-                    # We've exited [icons] and entered a new "group"
-                    if data.startswith("["):
-                        break
-                    
-                    # not what we're looking for
-                    if not data[:1].isnumeric():
-                        continue
-
-                    # Parsing
-                    index = data.index("=")
-
-                    # These are the bits of information we care about
-                    values = ["file"]
-                    for v in values:
-                        param_index = try_index(data, v)
-                        if param_index != -1:
-                            break
-                        # Don't need the line anymore, move on
-                    if param_index == -1:
-                        continue
-                    
-                    param = "file"
-
-                    # The number prefixing the line
-                    key = data[:param_index]
-                    if key.isnumeric():
-                        # Ignore levels with IDs above the levelcount
-                        # Because those are not visible when playing the game
-                        if int(key) <= level_count - 1:
-                            # If the level icon is new
-                            if icons.get(key) is None:
-                                icons[key] = {}
-                            # Store the level icon
-                            icons[key][param] = data[index + 1:]
-
-        # Update our grid object with the levels
-        for data in levels.values():
-            # Level position
-            position = flatten(data["X"], data["Y"], grid.width)
-
-            # Level color
-            if data.get("colour") is not None:
-                color = (int(data["colour"][0]), int(data["colour"][2]))
-                level = Item.level(color=color)
-            else:
-                level = Item.level()
-
-            # Level objects can be any color
-            level.position = position
-
-            # Levels are (sort of) like any other object
-            grid.cells[position].objects.append(level)
-            # Levels that use custom icons:
-            if data["style"] == "-1":
-                # The number of the level is the icon key
-                number = data["number"]
-                icon_file = icons[number]["file"]
-
-                icon = Item()
-                icon.position = position
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                # the game does not consider level icons objects, but 
-                # our rendering framework does:
-                # Remove _1 from the file name if
-                if icon_file.startswith("icon"):
-                    icon.name = icon_file[:-2]
-                else:
-                    icon.name = icon_file[:-4]
-                # Bring to the front layer whenever possible
-                icon.layer = 30
-                grid.cells[position].objects.append(icon)
-            # Levels using the dot icons + the default level icon
-            elif data["style"] == "2":
-                icon = Item()
-                icon.position = position
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                    # This is a hack to work around the fact that 
-                # This is a hack to work around the fact that 
-                # the game does not consider level icons objects, but 
-                # our rendering framework does:
-                # Create an item with the name "icon"
-                icon.name = "icon"
-                # Bring to the front layer whenever possible
-                icon.layer = 30
-                grid.cells[position].objects.append(icon)
-
-            # Handle the level tree
+            levels = {}
             if initialize:
-                # The parent node
-                node = {
-                    "mapID"  : map_id,
-                    "levels" : {}
-                }
-                # Key
-                parent = grid.filename
-                # Each level within
-                for l in levels.values():
-                    child = {
-                        "number" : l["number"],
-                        "name"   : l["name"],
-                        "style"  : l["style"]
-                    }
-                    # nice nested level ids
-                    node["levels"][l["file"]] = child
-                                            
-                self._levels[parent] = node
-        
-        return grid
-    
-    def add_paths(self, grid, file):
-        '''Adds raw path objects from within a level to the given Grid.
-        Objects are added to the Grid as regular objects without path information.
-        Data is parsed from the given file.
-        '''
-        file.seek(0)
-        paths = {}
-        path_count = 0
-
-        # Go through each line of the file
-        line = None
-        while line != "": 
-            line = file.readline().strip()                
-            # How many path objects are there in the map?
-            if line.startswith("paths="):
-                path_count = int(line[6:])
-            
-            # We've started parsing paths
-            if line == "[paths]":
-                data = None
-                while data != "":
-                    data = file.readline().strip()
-                    
-                    # We're done parsing
-                    # "[paths]" section is over
-                    # new section has started
-                    if data.startswith("["):
-                        break
-                    
-                    # not what we're looking for
-                    if not data[:1].isnumeric():
-                        continue
-
-                    # Parsing
-                    index = data.index("=")
-                    # These are the bits of information we care about
-                    values = ["X", "Y", "object", "dir"]
-                    for v in values:
-                        param_index = try_index(data, v)
-                        if param_index != -1:
+                values = ["x", "y", "style", "colour", "number", "file", "name"]
+            else:
+                values = ["x", "y", "style", "colour", "number"]
+            for k, v in levels_section.items():
+                for x in values:
+                    if k.endswith(x):
+                        key = k[:k.index(x)]
+                        if key.isnumeric() and int(key) < level_count:
+                            levels.setdefault(key, {})[x] = v
                             break
-                    if param_index == -1:
-                        continue
-
-                    # This will be "X", "Y", "object" or "dir"
-                    param = data[param_index:index]
-
-                    # The number prefixing the line
-                    key = data[:param_index]
-                    if key.isnumeric():
-                        # Ignore paths with IDs above the pathcount
-                        # Because those are not actual paths???
-                        if int(key) <= path_count - 1:
-                            # If the path is new
-                            if paths.get(key) is None:
-                                paths[key] = {}
-                            # Store the path position, dir & object
-                            paths[key][param] = data[index + 1:]
-
-        # Update our grid object with the levels
-        for data in paths.values():
-            path = Item()
-            position = flatten(data["X"], data["Y"], grid.width)
-
-            path.position  = position
-            path.direction = int(data["dir"])
-            path.obj       = data["object"]
-            path.ID        = self.defaults_by_object[data["object"]].ID
-            path.name      = self.defaults_by_object[data["object"]].name
-            # Paths are (sort of) like any other object
-            grid.cells[position].objects.append(path)
-        
-        
-        return grid
-
-    def add_images(self, grid, file):
-        '''Adds background image data from a level to the given Grid.
-        Data is parsed from the given file.
-        '''
-        # The .ld file
-        file.seek(0)
-        images = {}
-
-        # Go through each line of the file
-        line = None
-        while line != "":
-            line = file.readline().strip()            
-            # This is where we begin parsing
-            if line == "[images]":
-                data = None
-                while data != "":
-                    data = file.readline().strip()
-                    
-                    # We're done parsing
-                    # The "[images]" section is over and
-                    # A new section has begun
-                    if data.startswith("["):
-                        break
-                    
-                    # not what we're looking for
-                    if not data[0].isnumeric():
-                        continue
-
-                    # Parsing
-                    index = data.index("=")
-                    # This dictates the order of the images
-                    # Lower key -> lower Z position
-                    key = data[:index]
-                    value = data[index + 1:]
-                    
-                    # Store this
-                    images[key] = value
-
-        # Convert to list 
-        sorted_images = dict(sorted(images.items(), key=lambda x: int(x[0])))
-        sorted_list = [s for s in sorted_images.values()]
-        # Update our grid
-        grid.images = sorted_list
-        return grid
-
-    def add_specials(self, grid, file, initialize=False):
-        '''Adds special objects from within a level to the given Grid.
-        Data is parsed from the given file.
-        '''
-        # the .ld file
-        file.seek(0)
-        specials = {}
-        special_count = 0
-        map_id = ""
-        # Go through each line of the file
-        line = None
-        while line != "":
-            line = file.readline().strip()                
-            # How many speicl objects are there in the map?
-            if line.startswith("specials="):
-                special_count = int(line[9:])
-            # When initializing the level tree:
-            if initialize and line.startswith("mapid="):
-                map_id = line[6:]
             
-            # We've started parsing paths
-            if line == "[specials]":
-                data = None
-                while data != "":
-                    data = file.readline().strip()
+            icons = {}
+            if conf.has_section("icons"):
+                icons_section = conf["icons"]
+                for k, v in icons_section.items():
+                    if k.endswith("file"):
+                        key = k[:k.index("file")]
+                        if key.isnumeric() and int(key) < level_count:
+                            icons.setdefault(key, {})["file"] = v
+            
+
+            # # Go through each line of the file
+            # line = None
+            # while line != "":
+            #     line = file.readline().strip()
+            #     # How many levels are there in the map??
+            #     if line.startswith("levels="):
+            #         level_count = int(line[7:])
+            #     # When initializing the level tree:
+            #     if initialize and line.startswith("mapid="):
+            #         map_id = line[6:]
+                
+            #     # We're starting parsing levels
+            #     if line == "[levels]":
+            #         data = None
+            #         while data != "":
+            #             data = file.readline().strip()
+                        
+            #             # We're done parsing
+            #             # We've exited [levels] and entered a new "group"
+            #             if data.startswith("["):
+            #                 break
+                        
+            #             # not what we're looking for
+            #             if not data[:1].isnumeric():
+            #                 continue
+
+            #             # Parsing
+            #             index = data.index("=")
+
+            #             # These are the bits of information we care about
+            #             if initialize:
+            #                 values = ["X", "Y", "style", "colour", "number", "file", "name"]
+            #             else:
+            #                 values = ["X", "Y", "style", "colour", "number"]
+            #             for v in values:
+            #                 param_index = try_index(data, v)
+            #                 if param_index != -1:
+            #                     break
+            #                 # Don't need the line anymore, move on
+            #             if param_index == -1:
+            #                 continue
+                        
+            #             # This will be an element of `values`
+            #             param = data[param_index:index]
+
+            #             # The number prefixing the line
+            #             key = data[:param_index]
+            #             if key.isnumeric():
+            #                 # Ignore levels with IDs above the levelcount
+            #                 # Because those are not actual levels???
+            #                 if int(key) <= level_count - 1:
+            #                     # If the level is new
+            #                     if levels.get(key) is None:
+            #                         levels[key] = {}
+            #                     # Store the level data
+            #                     levels[key][param] = data[index + 1:]
                     
-                    # We're done parsing
-                    # "[specials]" section is over
-                    # new section has started
-                    if data.startswith("["):
-                        break
+                # # We're starting parsing level icons
+                # if line == "[icons]":
+                #     data = None
+                #     while data != "":
+                #         data = file.readline().strip()
+                        
+                #         # We're done parsing
+                #         # We've exited [icons] and entered a new "group"
+                #         if data.startswith("["):
+                #             break
+                        
+                #         # not what we're looking for
+                #         if not data[:1].isnumeric():
+                #             continue
 
-                    # not what we're looking for
-                    if not data[:1].isnumeric():
-                        continue
+                #         # Parsing
+                #         index = data.index("=")
 
-                    # Parsing
-                    index = data.index("=")
-                    # These are the bits of information we care about
-                    values = ["X", "Y", "data"]
-                    for v in values:
-                        param_index = try_index(data, v)
-                        if param_index != -1:
-                            break
-                    if param_index == -1:
-                        continue
-                    
-                    # This will be "X", or "Y" or "data"
-                    param = data[param_index:index]
+                #         # These are the bits of information we care about
+                #         values = ["file"]
+                #         for v in values:
+                #             param_index = try_index(data, v)
+                #             if param_index != -1:
+                #                 break
+                #             # Don't need the line anymore, move on
+                #         if param_index == -1:
+                #             continue
+                        
+                #         param = "file"
 
-                    # The number prefixing the line
-                    key = data[:param_index]
-                    if key.isnumeric():
-                        # Ignore specials with IDs above the pathcount
-                        # Because those are not actual specials???
-                        if int(key) <= special_count - 1:
-                            # If the special is new
-                            if specials.get(key) is None:
-                                specials[key] = {}
-                            # Store the special position & data
-                            specials[key][param] = data[index + 1:]
-    
-        # Handle the actual special information
-        for special in specials.values():
-            split = special["data"].split(",") 
-            if split[0] == "level":
-                position = flatten(special["X"], special["Y"], grid.width)
-                level = Item.level()
+                #         # The number prefixing the line
+                #         key = data[:param_index]
+                #         if key.isnumeric():
+                #             # Ignore levels with IDs above the levelcount
+                #             # Because those are not visible when playing the game
+                #             if int(key) <= level_count - 1:
+                #                 # If the level icon is new
+                #                 if icons.get(key) is None:
+                #                     icons[key] = {}
+                #                 # Store the level icon
+                #                 icons[key][param] = data[index + 1:]
+
+            # Update our grid object with the levels
+            for data in levels.values():
+                # Level position
+                position = flatten(data["x"], data["y"], grid.width)
+
+                # Level color
+                if data.get("colour") is not None:
+                    color = (int(data["colour"][0]), int(data["colour"][2]))
+                    level = Item.level(color=color)
+                else:
+                    level = Item.level()
+
+                # Level objects can be any color
                 level.position = position
-                # grid.cells[position].objects.append(level)
+
+                # Levels are (sort of) like any other object
+                grid.cells[position].objects.append(level)
+                # Levels that use custom icons:
+                if data["style"] == "-1":
+                    # The number of the level is the icon key
+                    number = data["number"]
+                    icon_file = icons[number]["file"]
+
+                    icon = Item()
+                    icon.position = position
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                    # the game does not consider level icons objects, but 
+                    # our rendering framework does:
+                    # Remove _1 from the file name if
+                    if icon_file.startswith("icon"):
+                        icon.name = icon_file[:-2]
+                    else:
+                        icon.name = icon_file[:-4]
+                    # Bring to the front layer whenever possible
+                    icon.layer = 30
+                    grid.cells[position].objects.append(icon)
+                # Levels using the dot icons + the default level icon
+                elif data["style"] == "2":
+                    icon = Item()
+                    icon.position = position
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                        # This is a hack to work around the fact that 
+                    # This is a hack to work around the fact that 
+                    # the game does not consider level icons objects, but 
+                    # our rendering framework does:
+                    # Create an item with the name "icon"
+                    icon.name = "icon"
+                    # Bring to the front layer whenever possible
+                    icon.layer = 30
+                    grid.cells[position].objects.append(icon)
 
                 # Handle the level tree
                 if initialize:
                     # The parent node
-                    map_id = grid.map_id
-                    for parent_id,children in self._levels.items():
-                        if children.get("mapID") == map_id:
-                            parent = parent_id
-                    
-                    # Relevant fields
-                    level_id = split[1]
-                    style = split[2]
-                    number = split[3]
-                                                
-                    self._levels[parent]["levels"][level_id] = {
-                        "number" : number,
-                        "style"  : style,
-                        "name"   : None
+                    node = {
+                        "mapID"  : map_id,
+                        "levels" : {}
                     }
+                    # Key
+                    parent = grid.filename
+                    # Each level within
+                    for l in levels.values():
+                        child = {
+                            "number" : l["number"],
+                            "name"   : l["name"],
+                            "style"  : l["style"]
+                        }
+                        # nice nested level ids
+                        node["levels"][l["file"]] = child
+                                                
+                    self._levels[parent] = node
+        
+        return grid
+    
+    def add_paths(self, grid, conf: configparser.ConfigParser):
+        '''Adds raw path objects from within a level to the given Grid.
+        Objects are added to the Grid as regular objects without path information.
+        Data is parsed from the given file.
+        '''
+        path_count = conf.getint("general", "paths")
+        if conf.has_section("paths"):
+            section = conf["paths"]
+
+            paths = {}
+            values = ["x", "y", "object", "dir"]
+            for k, v in section.items():
+                for x in values:
+                    if k.endswith(x):
+                        key = k[:k.index(x)]
+                        if key.isnumeric() and int(key) < path_count:
+                            paths.setdefault(key, {})[x] = v
+                            break
+
+        # # Go through each line of the file
+        # line = None
+        # while line != "": 
+        #     line = file.readline().strip()                
+        #     # How many path objects are there in the map?
+        #     if line.startswith("paths="):
+        #         path_count = int(line[6:])
+            
+        #     # We've started parsing paths
+        #     if line == "[paths]":
+        #         data = None
+        #         while data != "":
+        #             data = file.readline().strip()
+                    
+        #             # We're done parsing
+        #             # "[paths]" section is over
+        #             # new section has started
+        #             if data.startswith("["):
+        #                 break
+                    
+        #             # not what we're looking for
+        #             if not data[:1].isnumeric():
+        #                 continue
+
+        #             # Parsing
+        #             index = data.index("=")
+        #             # These are the bits of information we care about
+        #             values = ["X", "Y", "object", "dir"]
+        #             for v in values:
+        #                 param_index = try_index(data, v)
+        #                 if param_index != -1:
+        #                     break
+        #             if param_index == -1:
+        #                 continue
+
+        #             # This will be "X", "Y", "object" or "dir"
+        #             param = data[param_index:index]
+
+        #             # The number prefixing the line
+        #             key = data[:param_index]
+        #             if key.isnumeric():
+        #                 # Ignore paths with IDs above the pathcount
+        #                 # Because those are not actual paths???
+        #                 if int(key) <= path_count - 1:
+        #                     # If the path is new
+        #                     if paths.get(key) is None:
+        #                         paths[key] = {}
+        #                     # Store the path position, dir & object
+        #                     paths[key][param] = data[index + 1:]
+
+        # Update our grid object with the levels
+            for data in paths.values():
+                path = Item()
+                position = flatten(data["x"], data["y"], grid.width)
+
+                path.position  = position
+                path.direction = int(data["dir"])
+                path.obj       = data["object"]
+                path.ID        = self.defaults_by_object[data["object"]].ID
+                path.name      = self.defaults_by_object[data["object"]].name
+                # Paths are (sort of) like any other object
+                grid.cells[position].objects.append(path)
+        
+        
+        return grid
+
+    def add_images(self, grid, conf: configparser.ConfigParser):
+        '''Adds background image data from a level to the given Grid.
+        Data is parsed from the given file.
+        '''
+        # The .ld file
+        images = {}
+        
+        if conf.has_section("images"):
+            section = conf["images"]
+            for k, v in section.items():
+                if k.isnumeric():
+                    images[k] = v
+
+            # # Go through each line of the file
+            # line = None
+            # while line != "":
+            #     line = file.readline().strip()            
+            #     # This is where we begin parsing
+            #     if line == "[images]":
+            #         data = None
+            #         while data != "":
+            #             data = file.readline().strip()
+                        
+            #             # We're done parsing
+            #             # The "[images]" section is over and
+            #             # A new section has begun
+            #             if data.startswith("["):
+            #                 break
+                        
+            #             # not what we're looking for
+            #             if not data[0].isnumeric():
+            #                 continue
+
+            #             # Parsing
+            #             index = data.index("=")
+            #             # This dictates the order of the images
+            #             # Lower key -> lower Z position
+            #             key = data[:index]
+            #             value = data[index + 1:]
+                        
+            #             # Store this
+            #             images[key] = value
+
+            # Convert to list 
+            sorted_images = dict(sorted(images.items()))
+            sorted_list = [s for s in sorted_images.values()]
+            # Update our grid
+            grid.images = sorted_list
+        return grid
+
+    def add_specials(self, grid, conf: configparser.ConfigParser, initialize=False):
+        '''Adds special objects from within a level to the given Grid.
+        Data is parsed from the given file.
+        '''
+        special_count = conf.getint("general", "specials", fallback=0)
+        map_id = conf.get("general", "mapid", fallback="")
+        
+        if conf.has_section("specials"):
+            section = conf["specials"]
+            specials = {}
+            values = ["x", "y", "data"]
+            for k, v in section.items():
+                for x in values:
+                    if k.endswith(x):
+                        key = k[:k.index(x)]
+                        if key.isnumeric() and int(key) < special_count:
+                            specials.setdefault(key, {})[x] = v
+                            break
+            # # Go through each line of the file
+            # line = None
+            # while line != "":
+            #     line = file.readline().strip()                
+            #     # How many speicl objects are there in the map?
+            #     if line.startswith("specials="):
+            #         special_count = int(line[9:])
+            #     # When initializing the level tree:
+            #     if initialize and line.startswith("mapid="):
+            #         map_id = line[6:]
+                
+            #     # We've started parsing paths
+            #     if line == "[specials]":
+            #         data = None
+            #         while data != "":
+            #             data = file.readline().strip()
+                        
+            #             # We're done parsing
+            #             # "[specials]" section is over
+            #             # new section has started
+            #             if data.startswith("["):
+            #                 break
+
+            #             # not what we're looking for
+            #             if not data[:1].isnumeric():
+            #                 continue
+
+            #             # Parsing
+            #             index = data.index("=")
+            #             # These are the bits of information we care about
+            #             values = ["X", "Y", "data"]
+            #             for v in values:
+            #                 param_index = try_index(data, v)
+            #                 if param_index != -1:
+            #                     break
+            #             if param_index == -1:
+            #                 continue
+                        
+            #             # This will be "X", or "Y" or "data"
+            #             param = data[param_index:index]
+
+            #             # The number prefixing the line
+            #             key = data[:param_index]
+            #             if key.isnumeric():
+            #                 # Ignore specials with IDs above the pathcount
+            #                 # Because those are not actual specials???
+            #                 if int(key) <= special_count - 1:
+            #                     # If the special is new
+            #                     if specials.get(key) is None:
+            #                         specials[key] = {}
+            #                     # Store the special position & data
+            #                     specials[key][param] = data[index + 1:]
+
+            # Handle the actual special information
+            for special in specials.values():
+                split = special["data"].split(",") 
+                if split[0] == "level":
+                    position = flatten(special["x"], special["y"], grid.width)
+                    level = Item.level()
+                    level.position = position
+                    # grid.cells[position].objects.append(level)
+
+                    # Handle the level tree
+                    if initialize:
+                        # The parent node
+                        map_id = grid.map_id
+                        parent = grid.filename
+                        for parent_id,children in self._levels.items():
+                            if children.get("mapID") == map_id:
+                                parent = parent_id
+                        
+                        # Relevant fields
+                        level_id = split[1]
+                        style = split[2]
+                        number = split[3]
+                                                    
+                        self._levels[parent]["levels"][level_id] = {
+                            "number" : number,
+                            "style"  : style,
+                            "name"   : None
+                        }
 
         return grid
             
@@ -1124,6 +1192,11 @@ class Reader(commands.Cog, command_attrs=dict(hidden=True)):
             for j in range(len(dirs_buffer) - 1):
                 item = items[j]
                 item.direction = dirs_buffer[j]
+
+    @tasks.loop(minutes=15)
+    async def save_custom_levels(self):
+        with open("cache/customlevels.json", "wt") as fp:
+            json.dump(self.custom_levels, fp, indent=3)
 
 def setup(bot):
     bot.add_cog(Reader(bot))

@@ -1076,7 +1076,7 @@ class GlobalCog(commands.Cog, name="Baba Is You"):
             if re.match(r"^[A-Z0-9]{4}\-[A-Z0-9]{4}$", upper):
                 custom_levels = self.bot.get_cog("Reader").custom_levels
                 if custom_levels.get(upper) is not None:
-                    print("a")
+                    # Cached custom level
                     levels[upper] = custom_levels[upper]
                     custom = True
                 else:
